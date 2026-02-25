@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # NLP Service (Python + FastAPI)
+  nlp-service:
+    build:
+      context: ./nlp-service
+      dockerfile: Dockerfile
+    container_name: nlp-mongodb-nlp-service
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_ATLAS_URI=${MONGODB_ATLAS_URI}
+      - DATABASE_NAME=${DATABASE_NAME:-sample_mflix}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-3.5-turbo}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-pro}
+      - LOCAL_LLM_BASE_URL=${LOCAL_LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-llama-3-8b-instruct}
+      - PORT=8000
+    restart: unless-stopped
+    networks:
+      - nlp-mongodb-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Backend (Node.js + Express)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nlp-mongodb-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE=7d
+      - NLP_SERVICE_URL=http://nlp-service:8000
+      - PORT=5000
+      - NODE_ENV=production
+      - CORS_ORIGIN=http://localhost:3000
+    depends_on:
+      nlp-service:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - nlp-mongodb-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Frontend (React + Vite)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nlp-mongodb-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:5000/api
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - nlp-mongodb-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+networks:
+  nlp-mongodb-network:
+    driver: bridge
+
+volumes:
+  mongodb-data:
