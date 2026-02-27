@@ -42,7 +42,7 @@ def validate_mql_safety(mql: Dict[str, Any]) -> tuple[bool, str]:
     if not isinstance(mql, dict):
         return True, ""  # Not a dict, let MongoDB handle it
     
-    # Dangerous operations to block
+    # Dangerous operators to block anywhere in payload
     dangerous_ops = [
         "$drop",
         "$dropDatabase",
@@ -56,12 +56,11 @@ def validate_mql_safety(mql: Dict[str, Any]) -> tuple[bool, str]:
     for op in dangerous_ops:
         if op.lower() in mql_str:
             return False, f"Dangerous operation '{op}' is not allowed"
-    
-    # Check for unfiltered deletes
-    if mql.get("operation") == "delete":
-        query = mql.get("query", {})
-        if not query or query == {}:
-            return False, "Delete operations must include a specific filter (cannot be empty)"
+
+    # Only read operations are allowed in this application flow
+    operation = str(mql.get("operation", "find")).lower()
+    if operation not in {"find", "aggregate"}:
+        return False, f"Operation '{operation}' is not allowed. Only 'find' and 'aggregate' are supported."
     
     return True, ""
 

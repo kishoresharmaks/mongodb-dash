@@ -48,11 +48,12 @@ exports.getPlan = async (params) => {
 };
 
 // Execute a confirmed MQL query (Execution stage)
-exports.executeConfirmed = async ({ mql, database }) => {
+exports.executeConfirmed = async ({ mql, database, permissions }) => {
     try {
         const response = await nlpClient.post('/execute-mql', {
             mql,
-            database
+            database,
+            permissions
         });
 
         return response.data;

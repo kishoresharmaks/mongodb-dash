@@ -3,6 +3,31 @@ const RolePolicy = require('../models/RolePolicy');
 const nlpService = require('../services/nlp.service');
 const { v4: uuidv4 } = require('uuid');
 
+const safeJson = (value, maxLen = 1200) => {
+    try {
+        const serialized = JSON.stringify(value);
+        if (!serialized) return '';
+        return serialized.length > maxLen ? `${serialized.slice(0, maxLen)}...` : serialized;
+    } catch (e) {
+        return '';
+    }
+};
+
+const buildHistoryMessages = (queries = []) =>
+    queries.reverse().map((q) => {
+        const summary = q.errorMessage
+            ? `Error: ${q.errorMessage}`
+            : (q.explanation || `Found ${q.results?.count || 0} results.`);
+        const mqlPart = q.generatedMQL ? `\nMQL: ${safeJson(q.generatedMQL, 1500)}` : '';
+        const sample = q.results?.sample?.slice(0, 2) || [];
+        const samplePart = sample.length ? `\nSample: ${safeJson(sample, 900)}` : '';
+
+        return [
+            { role: 'user', content: q.naturalQuery },
+            { role: 'assistant', content: `${summary}${mqlPart}${samplePart}` }
+        ];
+    }).flat();
+
 // @desc    Get a query plan (planning stage)
 // @route   POST /api/query/plan
 // @access  Private
@@ -32,10 +57,7 @@ exports.getQueryPlan = async (req, res) => {
                 conversationId
             }).sort({ timestamp: -1 }).limit(5); // Last 5 messages
 
-            history = previousQueries.reverse().map(q => ([
-                { role: 'user', content: q.naturalQuery },
-                { role: 'assistant', content: q.errorMessage ? `Error: ${q.errorMessage}` : q.explanation || `Found ${q.results.count} results.` }
-            ])).flat();
+            history = buildHistoryMessages(previousQueries);
         }
 
         // Fetch user permissions
@@ -101,9 +123,15 @@ exports.executeConfirmedQuery = async (req, res) => {
             });
         }
 
+        const user = await req.user.populate('rolePolicy');
+        const permissions = user.rolePolicy?.permissions || {
+            collections: [{ name: '*', operations: ['find'], fields: ['*'], restrictedFields: [] }]
+        };
+
         const execution = await nlpService.executeConfirmed({
             mql,
-            database: database || req.user.preferences.defaultDatabase
+            database: database || req.user.preferences.defaultDatabase,
+            permissions
         });
 
         const executionTime = Date.now() - startTime;
@@ -188,10 +216,7 @@ exports.executeQuery = async (req, res) => {
                 conversationId: convId
             }).sort({ timestamp: -1 }).limit(5);
 
-            history = previousQueries.reverse().map(q => ([
-                { role: 'user', content: q.naturalQuery },
-                { role: 'assistant', content: q.errorMessage ? `Error: ${q.errorMessage}` : q.explanation || `Found ${q.results.count} results.` }
-            ])).flat();
+            history = buildHistoryMessages(previousQueries);
         }
 
         // Fetch user permissions

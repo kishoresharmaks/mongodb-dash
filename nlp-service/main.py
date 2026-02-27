@@ -12,35 +12,44 @@ from utils.validators import validate_natural_query, sanitize_query
 # Global agent instance
 agent: Optional[MongoDBNLAgent] = None
 
+
+def _apply_request_database(database: Optional[str]) -> None:
+    """Apply per-request database context when provided."""
+    if not agent or not database:
+        return
+    agent.set_database(database)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     global agent
-    
+
     # Startup
-    print("\n" + "="*60)
-    print("🚀 Starting NLP Service for MongoDB")
-    print("="*60)
-    print(f"📊 Database: {settings.database_name}")
-    print(f"🤖 LLM Provider: {settings.llm_provider}")
-    print("="*60 + "\n")
-    
+    print("\n" + "=" * 60)
+    print("Starting NLP Service for MongoDB")
+    print("=" * 60)
+    print(f"Database: {settings.database_name}")
+    print(f"LLM Provider: {settings.llm_provider}")
+    print("=" * 60 + "\n")
+
     try:
         agent = MongoDBNLAgent(
             connection_string=settings.mongodb_atlas_uri,
             database_name=settings.database_name
         )
-        print("✅ MongoDB NL Agent initialized successfully\n")
+        print("MongoDB NL Agent initialized successfully\n")
     except Exception as e:
-        print(f"❌ Failed to initialize agent: {e}\n")
+        print(f"Failed to initialize agent: {e}\n")
         raise
-    
+
     yield
-    
+
     # Shutdown
     if agent:
         agent.close()
-    print("\n👋 NLP Service shutting down\n")
+    print("\nNLP Service shutting down\n")
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -59,6 +68,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # Pydantic models
 class QueryRequest(BaseModel):
     query: str = Field(..., description="Natural language query", min_length=1, max_length=5000)
@@ -70,7 +80,7 @@ class QueryRequest(BaseModel):
     policyName: Optional[str] = Field(None, description="Role policy name (optional)")
     customSystemPrompt: Optional[str] = Field(None, description="Custom base system prompt (optional)")
     visualizationHint: Optional[Dict[str, Any]] = Field(None, description="User's explicit chart type preference (optional)")
-    
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -87,9 +97,12 @@ class QueryRequest(BaseModel):
         }
     )
 
+
 class ExecuteMQLRequest(BaseModel):
     mql: Dict[str, Any] = Field(..., description="The MQL query to execute")
     database: Optional[str] = Field(None, description="Database name (optional)")
+    permissions: Optional[Dict[str, Any]] = Field(None, description="Role-based permissions (optional)")
+
 
 class QueryResponse(BaseModel):
     success: bool
@@ -106,12 +119,14 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
     metadata: Dict[str, Any] = {}
 
+
 class HealthResponse(BaseModel):
     status: str
     service: str
     llm_provider: str
     llm_model: str
     database: str
+
 
 # Routes
 @app.get("/", tags=["Root"])
@@ -130,57 +145,62 @@ async def root():
         }
     }
 
+
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Health check endpoint"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
     return {
         "status": "healthy",
         "service": "NLP MongoDB Service",
         "llm_provider": agent.llm_metadata["provider"],
         "llm_model": agent.llm_metadata["model"],
-        "database": settings.database_name
+        "database": agent.database_name
     }
+
 
 @app.get("/metadata/collections", tags=["Metadata"])
 async def get_collections():
     """Get list of available collections"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    return {"collections": agent.collections}
+    return {"collections": agent.collections, "database": agent.database_name}
+
 
 @app.post("/translate", response_model=QueryResponse, tags=["Query"])
 async def translate_query(request: QueryRequest):
     """
     Translate natural language query to MongoDB query and execute it.
     """
-    print(f"\n📥 Received Request: '{request.query}'")
-    
+    print(f"\nReceived Request: '{request.query}'")
+
     if not agent:
-        print("❌ Error: Agent not initialized!")
+        print("Error: Agent not initialized!")
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
     try:
+        _apply_request_database(request.database)
+
         # Sanitize query
-        print("🛠️ Sanitizing query...")
+        print("Sanitizing query...")
         sanitized_query = sanitize_query(request.query)
-        
+
         # Validate query
-        print("🛡️ Validating query...")
+        print("Validating query...")
         is_valid, error_msg = validate_natural_query(sanitized_query)
         if not is_valid:
-            print(f"⚠️ Validation failed: {error_msg}")
+            print(f"Validation failed: {error_msg}")
             return QueryResponse(
                 success=False,
                 explanation=f"Invalid query: {error_msg}",
                 error=error_msg,
                 metadata={"provider": agent.llm_metadata["provider"]}
             )
-        
+
         # Process query
-        print("🧠 Sending to MongoDB NL Agent...")
+        print("Sending to MongoDB NL Agent...")
         result = agent.process_query(
             natural_query=sanitized_query,
             collection=request.collection,
@@ -190,13 +210,13 @@ async def translate_query(request: QueryRequest):
             policy_name=request.policyName,
             custom_system_prompt=request.customSystemPrompt
         )
-        
-        print(f"✅ Processing complete. Success: {result.get('success')}")
+
+        print(f"Processing complete. Success: {result.get('success')}")
         return QueryResponse(**result)
-    
+
     except Exception as e:
         import traceback
-        print(f"🔥 CRITICAL ERROR in translate endpoint: {e}")
+        print(f"CRITICAL ERROR in translate endpoint: {e}")
         traceback.print_exc()
         return QueryResponse(
             success=False,
@@ -205,17 +225,20 @@ async def translate_query(request: QueryRequest):
             metadata={"provider": agent.llm_metadata["provider"] if agent else "unknown"}
         )
 
+
 @app.post("/plan", response_model=QueryResponse, tags=["Query"])
 async def plan_query(request: QueryRequest):
     """
     Generate a query plan without executing it.
     """
-    print(f"\n📥 Received Plan Request: '{request.query}'")
-    
+    print(f"\nReceived Plan Request: '{request.query}'")
+
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
     try:
+        _apply_request_database(request.database)
+
         sanitized_query = sanitize_query(request.query)
         is_valid, error_msg = validate_natural_query(sanitized_query)
         if not is_valid:
@@ -225,7 +248,7 @@ async def plan_query(request: QueryRequest):
                 error=error_msg,
                 metadata={"provider": agent.llm_metadata["provider"]}
             )
-        
+
         result = agent.generate_query_plan(
             natural_query=sanitized_query,
             collection=request.collection,
@@ -234,9 +257,9 @@ async def plan_query(request: QueryRequest):
             user_role=request.userRole,
             policy_name=request.policyName,
             custom_system_prompt=request.customSystemPrompt,
-            visualization_hint=request.visualizationHint  # NEW: Pass user's chart preference
+            visualization_hint=request.visualizationHint
         )
-        
+
         return QueryResponse(**result)
     except Exception as e:
         return QueryResponse(
@@ -246,19 +269,24 @@ async def plan_query(request: QueryRequest):
             metadata={"provider": agent.llm_metadata["provider"]}
         )
 
+
 @app.post("/execute-mql", response_model=QueryResponse, tags=["Query"])
 async def execute_mql_confirmed(request: ExecuteMQLRequest):
     """
     Execute a confirmed MQL query.
     """
-    print(f"\n📥 Received Execution Request for MQL")
-    
+    print("\nReceived Execution Request for MQL")
+
     if not agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
-    
+
     try:
-        result = agent.execute_mql(request.mql)
-        
+        _apply_request_database(request.database)
+        result = agent.execute_mql(
+            request.mql,
+            permissions=request.permissions
+        )
+
         return QueryResponse(
             success=True,
             mql_query=request.mql,

@@ -31,6 +31,7 @@ class MongoDBNLAgent:
         self.llm, self.llm_metadata = create_llm()
         
         # Connect to MongoDB
+        self.connection_string = connection_string
         self.client = MongoClient(connection_string)
         self.db = self.client[database_name]
         self.database_name = database_name
@@ -42,6 +43,18 @@ class MongoDBNLAgent:
         print(f"📚 Available collections: {', '.join(self.collections)}")
         
         # Initialize schema cache and preload
+        self.schema_cache = {}
+        self._preload_schemas()
+
+    def set_database(self, database_name: str):
+        """Switch active database context for subsequent prompt/schema/query operations."""
+        if not database_name or database_name == self.database_name:
+            return
+
+        print(f"🔄 Switching database context: {self.database_name} -> {database_name}")
+        self.db = self.client[database_name]
+        self.database_name = database_name
+        self.collections = self.db.list_collection_names()
         self.schema_cache = {}
         self._preload_schemas()
     
@@ -105,7 +118,216 @@ class MongoDBNLAgent:
                 # If it's switched to aggregate, the query should be wrapped in $match if not already
                 if "pipeline" not in mql:
                      mql["pipeline"] = [{"$match": query}]
+
+        # 3. Normalize common field-name aliases to real schema names
+        mql = self._normalize_field_aliases(mql)
+        mql = self._normalize_common_join_mistakes(mql)
         
+        return mql
+
+    def _normalize_common_join_mistakes(self, mql: Dict[str, Any]) -> Dict[str, Any]:
+        """Fix frequent cross-collection join mistakes in aggregate pipelines."""
+        if not isinstance(mql, dict):
+            return mql
+        if mql.get("collection") != "orders" or mql.get("operation") != "aggregate":
+            return mql
+
+        pipeline = mql.get("pipeline")
+        if not isinstance(pipeline, list):
+            return mql
+
+        def replace_paths(obj: Any, old_prefix: str, new_prefix: str) -> Any:
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in obj.items():
+                    new_k = k
+                    if isinstance(k, str) and k.startswith(old_prefix):
+                        new_k = new_prefix + k[len(old_prefix):]
+                    out[new_k] = replace_paths(v, old_prefix, new_prefix)
+                return out
+            if isinstance(obj, list):
+                return [replace_paths(i, old_prefix, new_prefix) for i in obj]
+            if isinstance(obj, str):
+                if obj.startswith(f"${old_prefix}"):
+                    return f"${new_prefix}{obj[len(old_prefix)+1:]}"
+                return obj
+            return obj
+
+        normalized = pipeline
+        renamed_user_info = False
+
+        for i, stage in enumerate(normalized):
+            if not isinstance(stage, dict):
+                continue
+            lookup = stage.get("$lookup")
+            if not isinstance(lookup, dict):
+                continue
+
+            local_field = lookup.get("localField")
+            from_coll = lookup.get("from")
+            foreign_field = lookup.get("foreignField")
+            as_field = lookup.get("as")
+
+            # orders.user always points to customers._id in this schema.
+            if local_field == "user" and from_coll == "users":
+                lookup["from"] = "customers"
+                if foreign_field != "_id":
+                    lookup["foreignField"] = "_id"
+                if as_field == "user_info":
+                    lookup["as"] = "customer_info"
+                    renamed_user_info = True
+
+            # Common product join path mistakes.
+            if from_coll == "products" and isinstance(local_field, str):
+                if local_field in {"items.product_id", "items.productId"}:
+                    lookup["localField"] = "items.product"
+
+            normalized[i]["$lookup"] = lookup
+
+        if renamed_user_info:
+            normalized = replace_paths(normalized, "user_info", "customer_info")
+
+            # If matching by customer_info.name, expand to first_name/last_name match.
+            for idx, stage in enumerate(normalized):
+                if not isinstance(stage, dict) or "$match" not in stage:
+                    continue
+                match_obj = stage.get("$match", {})
+                if not isinstance(match_obj, dict):
+                    continue
+                if "customer_info.name" in match_obj:
+                    name_expr = match_obj.pop("customer_info.name")
+                    normalized[idx]["$match"] = {
+                        "$and": [
+                            match_obj,
+                            {
+                                "$or": [
+                                    {"customer_info.first_name": name_expr},
+                                    {"customer_info.last_name": name_expr},
+                                    {
+                                        "$expr": {
+                                            "$regexMatch": {
+                                                "input": {
+                                                    "$concat": [
+                                                        {"$ifNull": ["$customer_info.first_name", ""]},
+                                                        " ",
+                                                        {"$ifNull": ["$customer_info.last_name", ""]}
+                                                    ]
+                                                },
+                                                "regex": name_expr.get("$regex", "") if isinstance(name_expr, dict) else str(name_expr),
+                                                "options": name_expr.get("$options", "i") if isinstance(name_expr, dict) else "i"
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+
+        mql["pipeline"] = normalized
+        return mql
+
+    def _normalize_field_aliases(self, mql: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize common field aliases used by LLMs to actual schema field names."""
+        if not isinstance(mql, dict):
+            return mql
+
+        collection = mql.get("collection")
+        if not collection:
+            return mql
+
+        alias_map_by_collection = {
+            "orders": {
+                "total": "total_amount",
+                "amount": "total_amount",
+                "totalAmount": "total_amount",
+                "orderDate": "order_date",
+                "createdAt": "order_date",
+                "date": "order_date",
+                "userId": "user",
+                "user_id": "user",
+                "customerId": "user",
+                "product_id": "product",
+                "productId": "product"
+            },
+            "products": {
+                "productId": "_id",
+                "product_id": "_id",
+                "category_id": "category",
+                "categoryId": "category",
+                "stock_quantity": "stock",
+                "stockQty": "stock",
+                "inventory": "stock",
+                "inventory_count": "stock"
+            },
+            "customers": {
+                "name": "first_name"
+            }
+        }
+
+        alias_map = alias_map_by_collection.get(collection, {})
+        if not alias_map:
+            return mql
+
+        def normalize_path(path: str) -> str:
+            if not isinstance(path, str):
+                return path
+            if path.startswith("$"):
+                sigil = "$"
+                raw = path[1:]
+            else:
+                sigil = ""
+                raw = path
+
+            parts = raw.split(".")
+            normalized = [alias_map.get(p, p) for p in parts]
+            return f"{sigil}{'.'.join(normalized)}"
+
+        def normalize_dict_keys(obj: Any) -> Any:
+            operator_arg_keys = {
+                "date", "format", "timezone", "onNull",
+                "unit", "binSize", "startOfWeek"
+            }
+            if isinstance(obj, dict):
+                out = {}
+                for key, value in obj.items():
+                    if isinstance(key, str) and key.startswith("$"):
+                        # Normalize argument keys for date operators:
+                        # $dateToString/$dateTrunc must use "date", not field-name keys.
+                        if key in {"$dateToString", "$dateTrunc"} and isinstance(value, dict):
+                            fixed = dict(value)
+                            if "date" not in fixed:
+                                for wrong_key in ["order_date", "created_at", "createdAt", "field"]:
+                                    if wrong_key in fixed:
+                                        fixed["date"] = fixed.pop(wrong_key)
+                                        break
+                            out[key] = normalize_dict_keys(fixed)
+                        else:
+                            out[key] = normalize_dict_keys(value)
+                    else:
+                        # Do not rewrite MongoDB operator argument keys (e.g. $dateToString.date)
+                        if isinstance(key, str) and key in operator_arg_keys:
+                            new_key = key
+                        else:
+                            new_key = normalize_path(key) if isinstance(key, str) else key
+                        # localField/foreignField are field-path values (not "$" expressions)
+                        if isinstance(key, str) and key in {"localField", "foreignField"} and isinstance(value, str):
+                            out[new_key] = normalize_path(value)
+                        else:
+                            out[new_key] = normalize_dict_keys(value)
+                return out
+            if isinstance(obj, list):
+                return [normalize_dict_keys(i) for i in obj]
+            if isinstance(obj, str) and obj.startswith("$"):
+                return normalize_path(obj)
+            return obj
+
+        for section in ["query", "projection", "sort"]:
+            if section in mql and isinstance(mql[section], dict):
+                mql[section] = normalize_dict_keys(mql[section])
+
+        if "pipeline" in mql and isinstance(mql["pipeline"], list):
+            mql["pipeline"] = normalize_dict_keys(mql["pipeline"])
+
         return mql
 
     def _get_collection_schema(self, collection_name: str, sample_size: int = 3, use_cache: bool = True) -> Dict[str, Any]:
@@ -939,7 +1161,7 @@ RESPONSE (JSON ONLY):"""
             }
     
     def _convert_dates(self, obj: Any) -> Any:
-        """Recursively convert { '$date': '...' } Extended JSON to Python datetime objects"""
+        """Recursively convert date-like payloads to Python datetime objects."""
         from datetime import datetime, timezone
         if isinstance(obj, dict):
             if "$date" in obj and len(obj) == 1:
@@ -954,6 +1176,50 @@ RESPONSE (JSON ONLY):"""
             return {k: self._convert_dates(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._convert_dates(item) for item in obj]
+        elif isinstance(obj, str):
+            # Convert plain ISO date strings as well (LLM often returns these in filters).
+            try:
+                # Guard to avoid converting arbitrary strings.
+                if len(obj) >= 10 and (obj[4:5] == "-" or obj.endswith("Z")):
+                    date_str = obj
+                    if date_str.endswith("Z"):
+                        date_str = date_str[:-1] + "+00:00"
+                    return datetime.fromisoformat(date_str)
+            except Exception:
+                return obj
+        return obj
+
+    def _convert_objectids(self, obj: Any, key_path: str = "") -> Any:
+        """Recursively convert ObjectId-like strings for id/reference fields."""
+        if isinstance(obj, dict):
+            converted = {}
+            for k, v in obj.items():
+                next_path = f"{key_path}.{k}" if key_path else str(k)
+                converted[k] = self._convert_objectids(v, next_path)
+            return converted
+
+        if isinstance(obj, list):
+            return [self._convert_objectids(item, key_path) for item in obj]
+
+        if isinstance(obj, str) and ObjectId.is_valid(obj):
+            # Convert only for likely id/reference field paths, not arbitrary strings.
+            leaf = key_path.split(".")[-1] if key_path else ""
+            normalized_path = key_path.lower()
+            id_leafs = {
+                "_id", "id", "user", "customer", "product", "category",
+                "userid", "customerid", "productid", "categoryid"
+            }
+            if (
+                leaf.lower() in id_leafs
+                or leaf.lower().endswith("_id")
+                or any(p in normalized_path for p in [".user", ".product", ".category", "items.product"])
+                or any(op in normalized_path for op in ["$in", "$nin", "$eq"])
+            ):
+                try:
+                    return ObjectId(obj)
+                except Exception:
+                    return obj
+
         return obj
 
     def _execute_query(self, mql: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -973,9 +1239,11 @@ RESPONSE (JSON ONLY):"""
             if operation == "aggregate":
                 pipeline = mql.get("pipeline", [])
                 pipeline = self._convert_dates(pipeline)  # Convert $date Extended JSON
+                pipeline = self._convert_objectids(pipeline)
                 results = list(collection.aggregate(pipeline))
             elif operation == "delete":
                 query_filter = mql.get("query", {})
+                query_filter = self._convert_objectids(query_filter)
                 if not query_filter:
                     raise ValueError("Delete operations must have a filter for safety")
                 
@@ -1004,6 +1272,7 @@ RESPONSE (JSON ONLY):"""
                 # Standard find operation
                 query_filter = mql.get("query", {})
                 query_filter = self._convert_dates(query_filter)  # Convert $date Extended JSON
+                query_filter = self._convert_objectids(query_filter)
                 projection = mql.get("projection")
                 sort = mql.get("sort")
                 limit = mql.get("limit", 1000) # Increased default to 100
@@ -1019,6 +1288,10 @@ RESPONSE (JSON ONLY):"""
                 cursor = cursor.limit(min(limit, 100000)) # Increased cap to 1000 for 'all' requests
                 results = list(cursor)
             
+            # Resolve common references in orders for better readability in UI tables.
+            if collection_name == "orders":
+                results = self._enrich_order_results(results)
+
             # Convert ObjectId and datetime to string for JSON serialization
             def stringify_ids(data):
                 if isinstance(data, list):
@@ -1038,6 +1311,94 @@ RESPONSE (JSON ONLY):"""
         except Exception as e:
             print(f"❌ Error executing query: {e}")
             raise
+
+    def _enrich_order_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Resolve customer/product ObjectIds in orders to readable names."""
+        if not results:
+            return results
+
+        try:
+            customer_ids = set()
+            product_ids = set()
+
+            for doc in results:
+                if not isinstance(doc, dict):
+                    continue
+
+                user_val = doc.get("user")
+                if isinstance(user_val, ObjectId):
+                    customer_ids.add(user_val)
+
+                items = doc.get("items")
+                if not isinstance(items, list):
+                    continue
+
+                for item in items:
+                    if isinstance(item, dict):
+                        p = item.get("product")
+                        if isinstance(p, ObjectId):
+                            product_ids.add(p)
+                    elif isinstance(item, ObjectId):
+                        product_ids.add(item)
+
+            customer_map = {}
+            if customer_ids:
+                for c in self.db["customers"].find(
+                    {"_id": {"$in": list(customer_ids)}},
+                    {"first_name": 1, "last_name": 1}
+                ):
+                    full_name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
+                    customer_map[c["_id"]] = full_name or str(c["_id"])
+
+            product_map = {}
+            if product_ids:
+                for p in self.db["products"].find(
+                    {"_id": {"$in": list(product_ids)}},
+                    {"name": 1}
+                ):
+                    product_map[p["_id"]] = p.get("name") or str(p["_id"])
+
+            enriched_docs = []
+            for doc in results:
+                if not isinstance(doc, dict):
+                    enriched_docs.append(doc)
+                    continue
+
+                new_doc = dict(doc)
+
+                user_val = new_doc.get("user")
+                if isinstance(user_val, ObjectId) and user_val in customer_map:
+                    new_doc["user_name"] = customer_map[user_val]
+
+                items = new_doc.get("items")
+                if isinstance(items, list):
+                    item_names = []
+                    new_items = []
+                    for item in items:
+                        if isinstance(item, dict):
+                            item_doc = dict(item)
+                            p = item_doc.get("product")
+                            if isinstance(p, ObjectId) and p in product_map:
+                                item_doc["product_name"] = product_map[p]
+                                item_names.append(product_map[p])
+                            new_items.append(item_doc)
+                        elif isinstance(item, ObjectId):
+                            pname = product_map.get(item, str(item))
+                            new_items.append({"product": item, "product_name": pname})
+                            item_names.append(pname)
+                        else:
+                            new_items.append(item)
+
+                    new_doc["items"] = new_items
+                    if item_names:
+                        new_doc["item_names"] = list(dict.fromkeys(item_names))
+
+                enriched_docs.append(new_doc)
+
+            return enriched_docs
+        except Exception as e:
+            print(f"Warning: order enrichment skipped: {e}")
+            return results
 
     def _validate_mql_against_permissions(self, mql: Dict[str, Any], permissions: Dict[str, Any], active_db: Optional[str] = None) -> tuple[bool, str]:
         """Validate MQL components against user permissions"""
@@ -1105,6 +1466,136 @@ RESPONSE (JSON ONLY):"""
                         
         return True, ""
 
+    def _validate_mql_against_schema(self, mql: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Validate generated MQL fields against real collection schema.
+        Strict check is applied for `find` operations.
+        """
+        if not isinstance(mql, dict):
+            return False, "MQL must be an object."
+
+        collection_name = mql.get("collection")
+        operation = str(mql.get("operation", "find")).lower()
+
+        if not collection_name:
+            return False, "Collection name not specified in query."
+        if collection_name not in self.collections:
+            return False, f"Collection '{collection_name}' does not exist in database '{self.db.name}'."
+
+        schema = self._get_collection_schema(collection_name)
+        allowed_fields = set(schema.get("fields", []))
+        if not allowed_fields:
+            return True, ""
+
+        def iter_user_fields(obj: Any):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(key, str):
+                        if not key.startswith("$"):
+                            yield key
+                        yield from iter_user_fields(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    yield from iter_user_fields(item)
+
+        invalid_fields = set()
+        for section in ("query", "projection", "sort"):
+            section_obj = mql.get(section, {})
+            if not isinstance(section_obj, dict):
+                continue
+            for field in iter_user_fields(section_obj):
+                if not field:
+                    continue
+                root = field.split(".")[0]
+                if root not in allowed_fields:
+                    invalid_fields.add(field)
+
+        if invalid_fields:
+            invalid = ", ".join(sorted(invalid_fields))
+            allowed = ", ".join(sorted(allowed_fields))
+            return False, f"Invalid field(s): {invalid}. Allowed root fields: {allowed}."
+
+        if operation == "aggregate":
+            pipeline = mql.get("pipeline", [])
+            if not isinstance(pipeline, list):
+                return False, "Aggregation pipeline must be an array."
+
+            derived_roots = set()
+            allowed_roots = set(allowed_fields)
+
+            def root_from_ref(ref: str) -> Optional[str]:
+                if not isinstance(ref, str) or not ref.startswith("$") or ref.startswith("$$"):
+                    return None
+                path = ref[1:]
+                if not path:
+                    return None
+                return path.split(".")[0]
+
+            def collect_ref_roots(obj: Any) -> set[str]:
+                roots = set()
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, str):
+                            root = root_from_ref(v)
+                            if root:
+                                roots.add(root)
+                        roots |= collect_ref_roots(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        roots |= collect_ref_roots(item)
+                elif isinstance(obj, str):
+                    root = root_from_ref(obj)
+                    if root:
+                        roots.add(root)
+                return roots
+
+            for stage in pipeline:
+                if not isinstance(stage, dict):
+                    continue
+
+                if "$lookup" in stage and isinstance(stage["$lookup"], dict):
+                    lookup = stage["$lookup"]
+                    local_field = lookup.get("localField")
+                    if isinstance(local_field, str):
+                        local_root = local_field.split(".")[0]
+                        if local_root not in allowed_roots and local_root not in derived_roots:
+                            return False, f"Invalid $lookup localField '{local_field}' for collection '{collection_name}'."
+
+                    as_field = lookup.get("as")
+                    if isinstance(as_field, str) and as_field:
+                        derived_roots.add(as_field.split(".")[0])
+
+                if "$facet" in stage and isinstance(stage["$facet"], dict):
+                    for facet_key, facet_pipeline in stage["$facet"].items():
+                        if isinstance(facet_key, str) and facet_key:
+                            derived_roots.add(facet_key.split(".")[0])
+                        for root in collect_ref_roots(facet_pipeline):
+                            if root not in allowed_roots and root not in derived_roots and root != "_id":
+                                return False, f"Invalid field reference '${root}' in $facet pipeline."
+
+                if "$unwind" in stage:
+                    unwind = stage["$unwind"]
+                    unwind_path = unwind.get("path") if isinstance(unwind, dict) else unwind
+                    if isinstance(unwind_path, str) and unwind_path.startswith("$"):
+                        unwind_root = unwind_path[1:].split(".")[0]
+                        if unwind_root not in allowed_roots and unwind_root not in derived_roots:
+                            return False, f"Invalid $unwind path '{unwind_path}' for collection '{collection_name}'."
+
+                if "$group" in stage and isinstance(stage["$group"], dict):
+                    for out_key in stage["$group"].keys():
+                        if out_key != "_id":
+                            derived_roots.add(out_key.split(".")[0])
+
+                if "$addFields" in stage and isinstance(stage["$addFields"], dict):
+                    for out_key in stage["$addFields"].keys():
+                        derived_roots.add(out_key.split(".")[0])
+
+                for root in collect_ref_roots(stage):
+                    if root not in allowed_roots and root not in derived_roots and root != "_id":
+                        return False, f"Invalid field reference '${root}' for collection '{collection_name}'."
+
+        return True, ""
+
     def generate_query_plan(self, natural_query: str, collection: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, permissions: Optional[Dict[str, Any]] = None, user_role: Optional[str] = None, policy_name: Optional[str] = None, custom_system_prompt: Optional[str] = None, visualization_hint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Generate a query plan (MQL + Explanation) without executing it.
@@ -1168,6 +1659,23 @@ RESPONSE (JSON ONLY):"""
                     }
                 }
             
+            # Schema-first deterministic fallback for common business intents.
+            # This avoids LLM hallucinations on known query patterns.
+            rule_based_mql = self._build_rule_based_mql(natural_query, collection)
+            if rule_based_mql:
+                return {
+                    "success": True,
+                    "mql_query": rule_based_mql,
+                    "explanation": "I generated this query using a schema-verified deterministic template for accuracy.",
+                    "needs_confirmation": True,
+                    "metadata": {
+                        "provider": "rule_based",
+                        "model": "schema_first",
+                        "type": "database",
+                        "total_time": time.time() - start_time
+                    }
+                }
+
             # LLM-based logic below (when use_smart_template is False)
             print("🤖 Using LLM to generate query plan")
             # 1. Local NLP Analysis
@@ -1260,6 +1768,16 @@ RESPONSE (JSON ONLY):"""
             if llm_output.get("type") == "visualization":
                 print(f"📊 Response is a visualization ({llm_output.get('chart_type', 'bar')}).")
                 mql = llm_output.get("mql", {})
+                x_key = llm_output.get("x_key", "label")
+                y_key = llm_output.get("y_key", "value")
+                if isinstance(x_key, list):
+                    x_key = x_key[0] if x_key else "label"
+                if isinstance(y_key, list):
+                    y_key = y_key[0] if y_key else "value"
+                if not isinstance(x_key, str):
+                    x_key = str(x_key)
+                if not isinstance(y_key, str):
+                    y_key = str(y_key)
                 
                 # Ensure collection is set
                 if not mql.get("collection") and collection:
@@ -1276,8 +1794,8 @@ RESPONSE (JSON ONLY):"""
                     "type": "visualization",
                     "chart_type": llm_output.get("chart_type", "bar"),
                     "title": llm_output.get("title", "Data Visualization"),
-                    "x_key": llm_output.get("x_key", "label"),
-                    "y_key": llm_output.get("y_key", "value"),
+                    "x_key": x_key,
+                    "y_key": y_key,
                     "needs_confirmation": True,
                     "metadata": {
                         "provider": self.llm_metadata["provider"],
@@ -1298,6 +1816,58 @@ RESPONSE (JSON ONLY):"""
                 mql["collection"] = self._infer_collection(natural_query)
                 
             mql = self._fix_mql(mql) # Fix common LLM mistakes
+
+            # Validate schema correctness for generated query
+            is_schema_valid, schema_reason = self._validate_mql_against_schema(mql)
+            if not is_schema_valid:
+                print(f"Schema validation failed on first attempt: {schema_reason}")
+                print("Retrying once with schema feedback...")
+
+                repair_instruction = (
+                    f"{prompt}\n\n"
+                    "=== SCHEMA VALIDATION FEEDBACK (MUST FIX) ===\n"
+                    f"Previous MQL failed validation: {schema_reason}\n"
+                    "Regenerate using only valid schema fields and return JSON only."
+                )
+                repair_messages = [
+                    SystemMessage(content=system_instruction),
+                    HumanMessage(content=repair_instruction)
+                ]
+                repair_response = self.llm.invoke(repair_messages)
+                repair_text = repair_response.content if hasattr(repair_response, 'content') else str(repair_response)
+                print(f"DEBUG: Repair LLM Output:\n{repair_text}\n" + "-" * 50)
+                repaired_output = self._extract_mql_from_response(repair_text)
+
+                if repaired_output and repaired_output.get("mql") is not None:
+                    repaired_mql = repaired_output.get("mql", repaired_output)
+                    if not repaired_mql.get("collection") and collection:
+                        repaired_mql["collection"] = collection
+                    elif not repaired_mql.get("collection"):
+                        repaired_mql["collection"] = self._infer_collection(natural_query)
+                    repaired_mql = self._fix_mql(repaired_mql)
+
+                    repaired_ok, repaired_reason = self._validate_mql_against_schema(repaired_mql)
+                    if repaired_ok:
+                        mql = repaired_mql
+                        llm_output = repaired_output
+                        is_schema_valid = True
+                        print("Schema-repair retry succeeded.")
+                    else:
+                        schema_reason = repaired_reason
+                        print(f"Schema-repair retry failed: {schema_reason}")
+            if not is_schema_valid:
+                return {
+                    "success": False,
+                    "mql_query": mql,
+                    "explanation": f"⚠️ Query schema validation failed: {schema_reason}",
+                    "needs_confirmation": False,
+                    "error": "SchemaValidationFailed",
+                    "metadata": {
+                        "provider": self.llm_metadata["provider"],
+                        "model": self.llm_metadata["model"],
+                        "total_time": time.time() - start_time
+                    }
+                }
             
             # Validate against permissions
             if permissions:
@@ -1365,9 +1935,32 @@ RESPONSE (JSON ONLY):"""
                 }
             }
 
-    def execute_mql(self, mql: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_mql(self, mql: Dict[str, Any], permissions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Execute a previously generated and confirmed MQL query"""
         try:
+            if not isinstance(mql, dict):
+                raise ValueError("Invalid MQL payload")
+
+            mql = self._fix_mql(mql)
+
+            # Re-validate confirmed MQL before execution to prevent tampering/replay abuse.
+            is_safe, error_msg = validate_mql_safety(mql)
+            if not is_safe:
+                raise ValueError(f"Query safety violation: {error_msg}")
+
+            is_schema_valid, schema_reason = self._validate_mql_against_schema(mql)
+            if not is_schema_valid:
+                raise ValueError(f"Query schema validation failed: {schema_reason}")
+
+            if permissions:
+                is_allowed, reason = self._validate_mql_against_permissions(
+                    mql,
+                    permissions,
+                    active_db=self.db.name if self.db is not None else None
+                )
+                if not is_allowed:
+                    raise ValueError(f"Security policy violation: {reason}")
+
             results = self._execute_query(mql)
             return {
                 "success": True,
@@ -1375,7 +1968,8 @@ RESPONSE (JSON ONLY):"""
                 "metadata": {
                     "provider": self.llm_metadata["provider"],
                     "model": self.llm_metadata["model"],
-                    "result_count": len(results)
+                    "result_count": len(results),
+                    "validated_at_execute": True
                 }
             }
         except Exception as e:
@@ -1448,6 +2042,448 @@ RESPONSE (JSON ONLY):"""
             }
 
     
+    def _build_rule_based_mql(self, natural_query: str, collection_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return deterministic schema-safe MQL for known intents, else None."""
+        q = (natural_query or "").lower()
+        complex_markers = [
+            "return both",
+            "executive analytics",
+            "top 15 customers",
+            "ranked table",
+            "top_3_product_names",
+            "strict schema adherence",
+            "line-chart-ready monthly trend",
+            "also include one separate mql"
+        ]
+        is_complex_request = any(marker in q for marker in complex_markers)
+
+        # Intent: orders of customer named X with item names and customer name.
+        if (not is_complex_request) and ("order" in q) and ("named" in q) and ("item" in q):
+            name_match = re.search(r"named\s+([a-zA-Z][a-zA-Z\s\-]{1,60})", natural_query, re.IGNORECASE)
+            person_name = name_match.group(1).strip() if name_match else ""
+            person_name = re.split(r"\b(with|and|show|list|get)\b", person_name, flags=re.IGNORECASE)[0].strip()
+            if person_name:
+                return {
+                    "collection": "orders",
+                    "operation": "aggregate",
+                    "pipeline": [
+                        {
+                            "$lookup": {
+                                "from": "customers",
+                                "localField": "user",
+                                "foreignField": "_id",
+                                "as": "customer_info"
+                            }
+                        },
+                        {"$unwind": {"path": "$customer_info", "preserveNullAndEmptyArrays": False}},
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$regexMatch": {
+                                        "input": {
+                                            "$trim": {
+                                                "input": {
+                                                    "$concat": [
+                                                        {"$ifNull": ["$customer_info.first_name", ""]},
+                                                        " ",
+                                                        {"$ifNull": ["$customer_info.last_name", ""]}
+                                                    ]
+                                                }
+                                            }
+                                        },
+                                        "regex": re.escape(person_name),
+                                        "options": "i"
+                                    }
+                                }
+                            }
+                        },
+                        {"$unwind": {"path": "$items", "preserveNullAndEmptyArrays": True}},
+                        {
+                            "$lookup": {
+                                "from": "products",
+                                "localField": "items.product",
+                                "foreignField": "_id",
+                                "as": "product_info"
+                            }
+                        },
+                        {"$unwind": {"path": "$product_info", "preserveNullAndEmptyArrays": True}},
+                        {
+                            "$group": {
+                                "_id": "$_id",
+                                "customer_name": {
+                                    "$first": {
+                                        "$trim": {
+                                            "input": {
+                                                "$concat": [
+                                                    {"$ifNull": ["$customer_info.first_name", ""]},
+                                                    " ",
+                                                    {"$ifNull": ["$customer_info.last_name", ""]}
+                                                ]
+                                            }
+                                        }
+                                    }
+                                },
+                                "item_names": {"$addToSet": "$product_info.name"},
+                                "status": {"$first": "$status"},
+                                "total_amount": {"$first": "$total_amount"},
+                                "order_date": {"$first": "$order_date"}
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "order_id": "$_id",
+                                "customer_name": 1,
+                                "item_names": {
+                                    "$filter": {
+                                        "input": "$item_names",
+                                        "as": "n",
+                                        "cond": {"$ne": ["$$n", None]}
+                                    }
+                                },
+                                "status": 1,
+                                "total_amount": 1,
+                                "order_date": 1
+                            }
+                        },
+                        {"$sort": {"order_date": -1}},
+                        {"$limit": 50}
+                    ]
+                }
+
+        # Intent: "did all users/customers have at least 1 order?"
+        # In this schema, orders.user references customers._id (not users._id).
+        if (not is_complex_request) and ("order" in q) and ("all users" in q or "all customers" in q or "at least 1" in q or "atleast 1" in q):
+            asks_for_names = ("name" in q) or ("names" in q) or ("show me" in q and "customer" in q)
+            if asks_for_names:
+                return {
+                    "collection": "customers",
+                    "operation": "aggregate",
+                    "pipeline": [
+                        {
+                            "$lookup": {
+                                "from": "orders",
+                                "localField": "_id",
+                                "foreignField": "user",
+                                "as": "orders_data"
+                            }
+                        },
+                        {"$match": {"orders_data": {"$eq": []}}},
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "customer_name": {
+                                    "$trim": {
+                                        "input": {
+                                            "$concat": [
+                                                {"$ifNull": ["$first_name", ""]},
+                                                " ",
+                                                {"$ifNull": ["$last_name", ""]}
+                                            ]
+                                        }
+                                    }
+                                },
+                                "email": {"$ifNull": ["$email", ""]}
+                            }
+                        },
+                        {"$sort": {"customer_name": 1}},
+                        {"$limit": 500}
+                    ]
+                }
+            return {
+                "collection": "customers",
+                "operation": "aggregate",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "orders",
+                            "localField": "_id",
+                            "foreignField": "user",
+                            "as": "orders_data"
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_customers": {"$sum": 1},
+                            "customers_without_orders": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$eq": [{"$size": "$orders_data"}, 0]},
+                                        1,
+                                        0
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "total_customers": 1,
+                            "customers_without_orders": 1,
+                            "all_customers_have_orders": {"$eq": ["$customers_without_orders", 0]}
+                        }
+                    }
+                ]
+            }
+
+        # Intent: total quantity sold per product.
+        if (not is_complex_request) and ("product" in q) and ("quantity sold" in q or "total quantity sold" in q or "units sold" in q):
+            return {
+                "collection": "orders",
+                "operation": "aggregate",
+                "pipeline": [
+                    {"$unwind": "$items"},
+                    {
+                        "$lookup": {
+                            "from": "products",
+                            "localField": "items.product",
+                            "foreignField": "_id",
+                            "as": "product_info"
+                        }
+                    },
+                    {"$unwind": {"path": "$product_info", "preserveNullAndEmptyArrays": False}},
+                    {
+                        "$group": {
+                            "_id": "$product_info.name",
+                            "totalQuantitySold": {"$sum": "$items.quantity"}
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "productName": "$_id",
+                            "totalQuantitySold": 1
+                        }
+                    },
+                    {"$sort": {"totalQuantitySold": -1}},
+                    {"$limit": 1000}
+                ]
+            }
+
+        # Intent: shipped orders per month (typically for line chart/trend).
+        if (not is_complex_request) and ("order" in q) and ("month" in q) and ("ship" in q):
+            return {
+                "collection": "orders",
+                "operation": "aggregate",
+                "pipeline": [
+                    {"$match": {"status": "shipped"}},
+                    {
+                        "$group": {
+                            "_id": {
+                                "$dateToString": {
+                                    "format": "%Y-%m",
+                                    "date": "$order_date"
+                                }
+                            },
+                            "count": {"$sum": 1}
+                        }
+                    },
+                    {"$project": {"_id": 0, "month": "$_id", "count": 1}},
+                    {"$sort": {"month": 1}}
+                ]
+            }
+
+        # Intent: orders placed by customers from a given state/country.
+        if (not is_complex_request) and ("order" in q) and ("customer" in q) and (" from " in q):
+            loc_match = re.search(r"(?:customers?\s+from|from)\s+([a-zA-Z][a-zA-Z\\s\\-]{1,40})(?:\\b|$)", natural_query, re.IGNORECASE)
+            location = loc_match.group(1).strip() if loc_match else ""
+            # Remove common trailing words that can be captured in free-form prompts.
+            location = re.split(r"\b(with|show|list|get|and|who|that)\b", location, flags=re.IGNORECASE)[0].strip()
+
+            if location:
+                return {
+                    "collection": "orders",
+                    "operation": "aggregate",
+                    "pipeline": [
+                        {
+                            "$lookup": {
+                                "from": "customers",
+                                "localField": "user",
+                                "foreignField": "_id",
+                                "as": "customer_info"
+                            }
+                        },
+                        {"$unwind": {"path": "$customer_info", "preserveNullAndEmptyArrays": False}},
+                        {
+                            "$match": {
+                                "$or": [
+                                    {"customer_info.address.state": {"$regex": f"^{re.escape(location)}$", "$options": "i"}},
+                                    {"customer_info.address.country": {"$regex": f"^{re.escape(location)}$", "$options": "i"}}
+                                ]
+                            }
+                        },
+                        {"$sort": {"order_date": -1}},
+                        {"$unwind": {"path": "$items", "preserveNullAndEmptyArrays": True}},
+                        {
+                            "$lookup": {
+                                "from": "products",
+                                "localField": "items.product",
+                                "foreignField": "_id",
+                                "as": "product_info"
+                            }
+                        },
+                        {"$unwind": {"path": "$product_info", "preserveNullAndEmptyArrays": True}},
+                        {
+                            "$group": {
+                                "_id": "$_id",
+                                "order_date": {"$first": "$order_date"},
+                                "status": {"$first": "$status"},
+                                "total_amount": {"$first": "$total_amount"},
+                                "customer_name": {"$first": {"$concat": ["$customer_info.first_name", " ", "$customer_info.last_name"]}},
+                                "customer_email": {"$first": "$customer_info.email"},
+                                "customer_state": {"$first": "$customer_info.address.state"},
+                                "customer_country": {"$first": "$customer_info.address.country"},
+                                "product_names": {"$addToSet": "$product_info.name"}
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "order_id": "$_id",
+                                "order_date": 1,
+                                "status": 1,
+                                "total_amount": 1,
+                                "customer_name": 1,
+                                "customer_email": 1,
+                                "customer_state": 1,
+                                "customer_country": 1,
+                                "product_names": {
+                                    "$filter": {
+                                        "input": "$product_names",
+                                        "as": "pn",
+                                        "cond": {"$ne": ["$$pn", None]}
+                                    }
+                                }
+                            }
+                        },
+                        {"$sort": {"order_date": -1}},
+                        {"$limit": 200}
+                    ]
+                }
+
+        # Intent: total stock quantity per category, optionally with country.
+        wants_stock = ("stock" in q) and ("category" in q)
+        wants_country = "country" in q
+        if (not is_complex_request) and wants_stock:
+            product_schema = self._get_collection_schema("products")
+            category_schema = self._get_collection_schema("categories")
+            product_fields = set(product_schema.get("fields", []))
+            category_fields = set(category_schema.get("fields", []))
+
+            if "products" in self.collections and "categories" in self.collections and "category" in product_fields:
+                stock_field = "stock" if "stock" in product_fields else None
+                if not stock_field:
+                    # Try reasonable alternates if dataset differs
+                    for cand in ["stock_quantity", "inventory", "quantity", "inventory_count"]:
+                        if cand in product_fields:
+                            stock_field = cand
+                            break
+
+                if stock_field:
+                    country_field = None
+                    for cand in ["country", "country_name", "origin_country"]:
+                        if cand in product_fields:
+                            country_field = cand
+                            break
+
+                    group_id = {"category_name": "$category_info.name"}
+                    if wants_country and country_field:
+                        group_id["country"] = f"${country_field}"
+
+                    label_expr = "$_id.category_name"
+                    if wants_country and country_field:
+                        label_expr = {
+                            "$concat": [
+                                "$_id.category_name",
+                                " - ",
+                                {"$ifNull": [f"$_id.country", "Unknown"]}
+                            ]
+                        }
+
+                    return {
+                        "collection": "products",
+                        "operation": "aggregate",
+                        "pipeline": [
+                            {
+                                "$lookup": {
+                                    "from": "categories",
+                                    "localField": "category",
+                                    "foreignField": "_id",
+                                    "as": "category_info"
+                                }
+                            },
+                            {"$unwind": {"path": "$category_info", "preserveNullAndEmptyArrays": True}},
+                            {
+                                "$group": {
+                                    "_id": group_id,
+                                    "total_stock": {"$sum": f"${stock_field}"}
+                                }
+                            },
+                            {
+                                "$project": {
+                                    "_id": 0,
+                                    "label": label_expr,
+                                    "value": "$total_stock"
+                                }
+                            },
+                            {"$sort": {"value": -1}},
+                            {"$limit": 50}
+                        ]
+                    }
+
+        # Intent: total delivered product count + total revenue from delivered orders
+        delivered_tokens = ["delivered", "delivery"]
+        wants_products = ("product count" in q) or ("products count" in q) or ("product total" in q) or ("total delivered product" in q)
+        wants_revenue = ("revenue" in q) or ("total amount" in q) or ("sales" in q)
+        if (not is_complex_request) and any(tok in q for tok in delivered_tokens) and wants_products and wants_revenue:
+            return {
+                "collection": "orders",
+                "operation": "aggregate",
+                "pipeline": [
+                    {"$match": {"status": "delivered"}},
+                    {
+                        "$facet": {
+                            "revenue": [
+                                {"$group": {"_id": None, "totalRevenue": {"$sum": "$total_amount"}}}
+                            ],
+                            "products": [
+                                {"$unwind": "$items"},
+                                {"$group": {"_id": None, "totalDeliveredProductCount": {"$sum": "$items.quantity"}}}
+                            ]
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "totalRevenue": {"$ifNull": [{"$arrayElemAt": ["$revenue.totalRevenue", 0]}, 0]},
+                            "totalDeliveredProductCount": {"$ifNull": [{"$arrayElemAt": ["$products.totalDeliveredProductCount", 0]}, 0]}
+                        }
+                    }
+                ]
+            }
+
+        # Intent: most recent orders with status and total amount
+        if (not is_complex_request) and ("recent orders" in q or "most recent orders" in q or "latest orders" in q) and ("status" in q) and ("total amount" in q or "amount" in q):
+            limit = 10
+            m = re.search(r"\b(\d+)\b", q)
+            if m:
+                try:
+                    limit = max(1, min(int(m.group(1)), 100))
+                except Exception:
+                    pass
+            return {
+                "collection": collection_hint or "orders",
+                "operation": "find",
+                "query": {},
+                "projection": {"status": 1, "total_amount": 1, "order_date": 1, "_id": 0},
+                "sort": {"order_date": -1},
+                "limit": limit
+            }
+
+        return None
+
     def _build_visualization_mql(self, query: str, chart_type: str, collection_hint: Optional[str] = None) -> Dict[str, Any]:
         """
         Build guaranteed-correct visualization MQL with $lookup for ObjectId references.

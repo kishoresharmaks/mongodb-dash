@@ -13,7 +13,11 @@ import {
     Tooltip,
     Tabs,
     Tab,
-    Chip
+    Chip,
+    FormControl,
+    InputLabel,
+    Select,
+    MenuItem
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import TableChartIcon from '@mui/icons-material/TableChart';
@@ -63,6 +67,8 @@ const ChatInterface = ({ selectedConversationId }) => {
     const [activeTab, setActiveTab] = useState(0); // 0 for Table, 1 for Chart
     const [pendingPlan, setPendingPlan] = useState(null);
     const [debugMode, setDebugMode] = useState('llm'); // Changed default to 'llm' for real data experience
+    const [selectedXAxis, setSelectedXAxis] = useState('');
+    const [selectedYAxis, setSelectedYAxis] = useState('');
     const messagesEndRef = useRef(null);
     const [permissions, setPermissions] = useState(null);
 
@@ -284,6 +290,8 @@ const ChatInterface = ({ selectedConversationId }) => {
                 if (result.data.results && result.data.results.length > 0) {
                     setCurrentResults(result.data.results);
                     setActiveVisualization(visualizationConfig);
+                    setSelectedXAxis('');
+                    setSelectedYAxis('');
                     // If it's a visualization, default to the chart tab
                     if (visualizationConfig) {
                         setActiveTab(1);
@@ -324,6 +332,14 @@ const ChatInterface = ({ selectedConversationId }) => {
         acc[t.section].push(t);
         return acc;
     }, {});
+
+    const axisColumns = currentResults && currentResults.length > 0
+        ? [...new Set(currentResults.flatMap((r) => (r && typeof r === 'object' ? Object.keys(r) : [])))]
+        : [];
+    const xAxisOptions = axisColumns;
+    const yAxisOptions = axisColumns.filter((key) =>
+        currentResults?.some((row) => Number.isFinite(Number(row?.[key])))
+    );
 
     return (
         <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -470,6 +486,8 @@ const ChatInterface = ({ selectedConversationId }) => {
                                 onShowResults={() => {
                                     setCurrentResults(message.results || null);
                                     setActiveVisualization(message.visualization || null);
+                                    setSelectedXAxis('');
+                                    setSelectedYAxis('');
                                     setActiveTab(message.visualization ? 1 : 0);
                                     setIsResultsOpen(true);
                                 }}
@@ -479,28 +497,6 @@ const ChatInterface = ({ selectedConversationId }) => {
                     </>
                 )}
             </Box>
-
-            {/* Results popup trigger moved inside message bubble or floating button */}
-            {currentResults && currentResults.length > 0 && !isResultsOpen && (
-                <Box
-                    sx={{
-                        position: 'absolute',
-                        bottom: 90,
-                        left: '50%',
-                        transform: 'translateX(-50%)',
-                        zIndex: 10
-                    }}
-                >
-                    <Button
-                        variant="contained"
-                        startIcon={activeVisualization ? <BarChartIcon /> : <TableChartIcon />}
-                        onClick={() => setIsResultsOpen(true)}
-                        sx={{ borderRadius: 8, px: 4, boxShadow: 3 }}
-                    >
-                        View {activeVisualization ? 'Chart' : 'Results'} ({currentResults.length})
-                    </Button>
-                </Box>
-            )}
 
             {/* Popup Dialog for Results Explorer */}
             <Dialog
@@ -543,13 +539,43 @@ const ChatInterface = ({ selectedConversationId }) => {
                         <ResultTable results={currentResults} />
                     ) : (
                         <Box sx={{ p: 3, height: '100%', overflowY: 'auto' }}>
+                            <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
+                                <FormControl size="small" sx={{ minWidth: 220 }}>
+                                    <InputLabel>X Axis</InputLabel>
+                                    <Select
+                                        value={selectedXAxis}
+                                        label="X Axis"
+                                        onChange={(e) => setSelectedXAxis(e.target.value)}
+                                    >
+                                        <MenuItem value=""><em>Auto</em></MenuItem>
+                                        {xAxisOptions.map((col) => (
+                                            <MenuItem key={col} value={col}>{col}</MenuItem>
+                                        ))}
+                                    </Select>
+                                </FormControl>
+                                <FormControl size="small" sx={{ minWidth: 220 }}>
+                                    <InputLabel>Y Axis</InputLabel>
+                                    <Select
+                                        value={selectedYAxis}
+                                        label="Y Axis"
+                                        onChange={(e) => setSelectedYAxis(e.target.value)}
+                                    >
+                                        <MenuItem value=""><em>Auto</em></MenuItem>
+                                        {yAxisOptions.map((col) => (
+                                            <MenuItem key={col} value={col}>{col}</MenuItem>
+                                        ))}
+                                    </Select>
+                                </FormControl>
+                            </Box>
                             <VisualizationComponent
                                 data={currentResults}
-                                config={activeVisualization || {
-                                    chart_type: 'bar', // Fallback
-                                    title: 'Data Distribution',
-                                    x_key: currentResults && currentResults.length > 0 ? Object.keys(currentResults[0])[0] : null,
-                                    y_key: currentResults && currentResults.length > 0 ? Object.keys(currentResults[0])[1] : null
+                                config={{
+                                    ...(activeVisualization || {
+                                        chart_type: 'bar', // Fallback
+                                        title: 'Data Distribution'
+                                    }),
+                                    ...(selectedXAxis ? { x_key: selectedXAxis } : {}),
+                                    ...(selectedYAxis ? { y_key: selectedYAxis } : {})
                                 }}
                             />
                         </Box>
@@ -564,6 +590,18 @@ const ChatInterface = ({ selectedConversationId }) => {
 
             {/* Input box */}
             <Box sx={{ borderTop: 1, borderColor: 'divider', pb: 1 }}>
+                {currentResults && currentResults.length > 0 && !isResultsOpen && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', pt: 1.5, px: 2 }}>
+                        <Button
+                            variant="contained"
+                            startIcon={activeVisualization ? <BarChartIcon /> : <TableChartIcon />}
+                            onClick={() => setIsResultsOpen(true)}
+                            sx={{ borderRadius: 8, px: 4, boxShadow: 3 }}
+                        >
+                            View {activeVisualization ? 'Chart' : 'Results'} ({currentResults.length})
+                        </Button>
+                    </Box>
+                )}
                 {allowedCollections.length > 0 && (
                     <Box sx={{ px: 3, pt: 1.5, pb: 0, display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
                         <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: '800', letterSpacing: 1, mr: 1, fontSize: '0.65rem' }}>

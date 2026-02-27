@@ -58,8 +58,22 @@ const ResultTable = ({ results }) => {
     };
 
     // Helper to format cell content based on column name and value type
-    const formatCellContent = (column, value) => {
+    const formatCellContent = (column, value, row = {}) => {
         if (value === null || value === undefined) return '-';
+
+        // Prefer enriched name fields when present
+        if (column === 'user' && row.user_name) {
+            return String(row.user_name);
+        }
+        if (column === 'items' && Array.isArray(row.item_names) && row.item_names.length > 0) {
+            return (
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                    {row.item_names.map((item, idx) => (
+                        <Chip key={idx} label={String(item)} size="small" variant="outlined" />
+                    ))}
+                </Box>
+            );
+        }
 
         // Column-specific formatting
         if (column === 'genres' || column === 'directors' || column === 'cast') {
@@ -247,7 +261,7 @@ const ResultTable = ({ results }) => {
                             <TableRow key={index} hover sx={{ '&:last-child td, &:last-child th': { border: 0 } }}>
                                 {columns.map((column) => (
                                     <TableCell key={column}>
-                                        {formatCellContent(column, row[column])}
+                                        {formatCellContent(column, row[column], row)}
                                     </TableCell>
                                 ))}
                             </TableRow>
